@@ -242,6 +242,12 @@ curl http://127.0.0.1:7860/v1/messages \
 - Anthropic server-side tools 和 `mcp_servers` 目前不支持
 - README 中如果提到的外部脚本或部署目录与你本地实际内容不一致，请以仓库当前文件结构为准
 
+---
+
+Finally，Thanks to everyone on LinuxDo for their support! Welcome to join https://linux.do/ for all kinds of technical exchanges, cutting-edge AI information, and AI experience sharing, all on Linuxdo!
+
+---
+
 ## 参考文档
 
 - OpenAI Responses API: <https://platform.openai.com/docs/guides/responses-vs-chat-completions>
