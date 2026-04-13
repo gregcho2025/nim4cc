@@ -1,0 +1,57 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NIM 官方模型列表</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Noto+Sans+SC:wght@400;500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="catalog-page-body">
+    <main class="catalog-page-shell">
+      <header class="catalog-topbar">
+        <div>
+          <span class="mini-badge">官方模型目录</span>
+          <h1>NVIDIA NIM 模型列表</h1>
+        </div>
+        <div class="topbar-actions">
+          <a class="text-nav-link" href="/">返回健康度首页</a>
+        </div>
+      </header>
+
+      <section class="catalog-summary-grid" id="catalog-summary"></section>
+
+      <section class="catalog-filter-panel">
+        <div>
+          <span class="mini-badge subtle">筛选</span>
+          <h2>按模型提供商筛选</h2>
+        </div>
+        <div class="provider-filter-bar" id="provider-filter-bar"></div>
+      </section>
+
+      <section class="catalog-board-panel">
+        <div class="board-header-row">
+          <div>
+            <span class="mini-badge subtle">模型目录</span>
+            <h2>提供商卡片列表</h2>
+          </div>
+          <div class="board-meta-box">
+            <span>同步时间</span>
+            <strong id="catalog-updated">--</strong>
+          </div>
+        </div>
+
+        <div class="provider-grid" id="provider-grid"></div>
+        <p class="panel-hint" id="catalog-empty"></p>
+      </section>
+    </main>
+    <script src="/static/models.js" charset="utf-8" defer></script>
+  </body>
+</html>
+

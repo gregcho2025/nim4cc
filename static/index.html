@@ -1,0 +1,52 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NIM Responses Gateway</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Noto+Sans+SC:wght@400;500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="health-page-body">
+    <main class="health-page-shell">
+      <header class="health-topbar">
+        <div>
+          <span class="mini-badge">NIM Responses Gateway</span>
+          <h1>模型健康度</h1>
+          <p>使用方式：使用自己的NIM api_key作为Codex api_key，base_url为本站网址，请自行在config.toml中设置</p>
+        </div>
+        <div class="topbar-actions">
+          <a class="text-nav-link" href="/model_list">查看官方模型列表</a>
+          <button class="refresh-link" id="refresh-dashboard" type="button">刷新数据</button>
+        </div>
+      </header>
+
+      <section class="health-summary-grid" id="overview-cards"></section>
+
+      <section class="health-board-panel">
+        <div class="board-header-row">
+          <div>
+            <span class="mini-badge subtle">健康趋势</span>
+            <h2>最近 10 分钟成功率矩阵</h2>
+          </div>
+          <div class="board-meta-box">
+            <span>最近更新</span>
+            <strong id="dashboard-updated">--</strong>
+          </div>
+        </div>
+
+        <div class="timeline-header" id="timeline-header"></div>
+        <div class="health-list" id="health-grid"></div>
+        <p class="panel-hint" id="dashboard-empty"></p>
+      </section>
+    </main>
+    <script src="/static/public.js" charset="utf-8" defer></script>
+  </body>
+</html>
+

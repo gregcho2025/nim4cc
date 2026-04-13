@@ -1,0 +1,188 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NVIDIA NIM 管理后台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Noto+Sans+SC:wght@400;500;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body class="admin-body">
+    <div class="ambient ambient-left"></div>
+    <div class="ambient ambient-right"></div>
+    <div class="admin-shell">
+      <aside class="admin-sidebar">
+        <div class="brand-block">
+          <span class="hero-badge">NVIDIA NIM</span>
+          <h1>运营控制台</h1>
+          <p>管理模型目录、API Key、健康巡检和公开看板的数据来源。</p>
+        </div>
+        <h3>功能导航</h3>
+        <button class="sidebar-btn active" data-panel="overview">总览</button>
+        <button class="sidebar-btn" data-panel="models">模型管理</button>
+        <button class="sidebar-btn" data-panel="keys">Key 管理</button>
+        <button class="sidebar-btn" data-panel="health">巡检记录</button>
+        <button class="sidebar-btn" data-panel="settings">调度设置</button>
+      </aside>
+
+      <section class="admin-content">
+        <div class="glass-panel" data-panel="overview">
+          <div class="panel-headline">
+            <div>
+              <span class="section-tag">控制中心</span>
+              <h2>网关运行总览</h2>
+            </div>
+            <p class="status-text">统一查看模型、Key 和近几次健康探测结果。</p>
+          </div>
+          <div class="section-grid compact-grid" id="overview-metrics"></div>
+          <div class="glass-panel sub-panel">
+            <div class="panel-headline compact">
+              <div>
+                <span class="section-tag">最近活动</span>
+                <h3>最近巡检</h3>
+              </div>
+            </div>
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>模型</th>
+                  <th>状态</th>
+                  <th>时延</th>
+                </tr>
+              </thead>
+              <tbody id="recent-checks"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="glass-panel hidden" data-panel="models">
+          <div class="panel-headline">
+            <div>
+              <span class="section-tag">目录配置</span>
+              <h2>模型管理</h2>
+            </div>
+            <div class="inline-actions panel-actions">
+              <button class="secondary-btn" id="test-all-models" type="button">测试全部模型</button>
+            </div>
+          </div>
+          <p class="status-text">添加、删除、连通性测试，以及使用与巡检统计。</p>
+          <div class="section-grid compact-grid">
+            <div class="metric-card">
+              <h3>模型总数</h3>
+              <strong id="model-count">-</strong>
+            </div>
+            <div class="metric-card">
+              <h3>当前健康</h3>
+              <strong id="model-healthy">-</strong>
+            </div>
+          </div>
+          <div class="form-grid spaced-top">
+            <input id="model-id" placeholder="模型 ID，例如 z-ai/glm5" />
+            <input id="model-display-name" placeholder="展示名称，例如 GLM-5" />
+            <textarea id="model-description" placeholder="模型说明，将出现在后台管理视图中"></textarea>
+            <button id="model-add" type="button">新增或更新模型</button>
+          </div>
+          <table class="table spaced-top">
+            <thead>
+              <tr>
+                <th>模型</th>
+                <th>状态</th>
+                <th>调用次数</th>
+                <th>巡检统计</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="model-table"></tbody>
+          </table>
+        </div>
+
+        <div class="glass-panel hidden" data-panel="keys">
+          <div class="panel-headline">
+            <div>
+              <span class="section-tag">凭据配置</span>
+              <h2>NVIDIA NIM Key 管理</h2>
+            </div>
+            <div class="inline-actions panel-actions">
+              <button class="secondary-btn" id="test-all-keys" type="button">测试全部 Key</button>
+            </div>
+          </div>
+          <p class="status-text">统一维护可用 Key，并统计请求和巡检使用情况。</p>
+          <div class="form-grid compact-grid">
+            <input id="key-label" placeholder="Key 名称，例如 主生产 Key" />
+            <input id="key-value" placeholder="输入 NVIDIA NIM Key" />
+            <button id="key-add" type="button">保存 Key</button>
+          </div>
+          <table class="table spaced-top">
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>脱敏值</th>
+                <th>请求次数</th>
+                <th>最近测试</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="key-table"></tbody>
+          </table>
+        </div>
+
+        <div class="glass-panel hidden" data-panel="health">
+          <div class="panel-headline">
+            <div>
+              <span class="section-tag">健康巡检</span>
+              <h2>巡检记录</h2>
+            </div>
+            <button id="run-healthcheck" type="button">立即巡检全部模型</button>
+          </div>
+          <p class="status-text">手动触发的巡检结果会立刻写入数据库，并同步更新到公开健康页。</p>
+          <div class="section-grid" id="health-grid"></div>
+        </div>
+
+        <div class="glass-panel hidden" data-panel="settings">
+          <div class="panel-headline">
+            <div>
+              <span class="section-tag">计划任务</span>
+              <h2>调度设置</h2>
+            </div>
+            <p class="status-text">设置巡检开关、时间间隔、公开页保留时长和巡检提示词。</p>
+          </div>
+          <div class="form-grid settings-grid">
+            <label class="checkbox-row field-span-full">
+              <input id="healthcheck-enabled" type="checkbox" />
+              <span>启用定时健康巡检</span>
+            </label>
+            <input id="healthcheck-interval" type="number" min="5" step="5" placeholder="巡检间隔，单位分钟" />
+            <input id="public-history-hours" type="number" min="1" step="1" placeholder="公开页保留时长，单位小时" />
+            <textarea id="healthcheck-prompt" placeholder="用于健康巡检的提示词"></textarea>
+            <div class="inline-actions settings-actions field-span-full">
+              <button id="settings-save" type="button">保存设置</button>
+              <button class="secondary-btn" id="refresh-now" type="button">重新加载面板</button>
+            </div>
+          </div>
+          <p class="status-text" id="settings-status"></p>
+        </div>
+      </section>
+    </div>
+
+    <div class="login-overlay" id="login-overlay">
+      <div class="login-card">
+        <span class="section-tag">管理员登录</span>
+        <h2>进入后台</h2>
+        <p class="status-text">请输入环境变量 PASSWORD 的值。</p>
+        <label for="admin-password">后台密码</label>
+        <input type="password" id="admin-password" autocomplete="current-password" />
+        <button id="login-btn">解锁控制台</button>
+        <p class="status-text" id="login-status"></p>
+      </div>
+    </div>
+    <script src="/static/admin.js" charset="utf-8" defer></script>
+  </body>
+</html>

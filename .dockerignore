@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+.pytest_tmp/
+*.pyc
+*.pyo
+*.sqlite3
+.smoke.sqlite3
+uvicorn.log
+uvicorn.err.log
