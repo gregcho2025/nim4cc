@@ -1,22 +1,16 @@
-# NIM4CC
+# NIM4CC（让NIM的模型在Codex和Claude Code里面物尽其用）
 
 NIM4CC 是一个面向公开使用的 NVIDIA NIM 兼容网关，目标是把 NIM 的 `chat/completions` 能力转换成更易接入的上层协议，并补上模型目录缓存、调用统计和健康度看板。
 
-当前项目同时支持：
+并且可以快速便捷的部署在免费的huggingface space上面使用
+
+当前项目同时支持（可能支持不完全，遇到问题请带着相关日志提issue）：
 
 - OpenAI 风格的 `POST /v1/responses`
 - Anthropic 风格的 `POST /v1/messages`
 - Claude Code 常见客户端工具调用形态的兼容转发
 
 仓库地址：<https://github.com/Geek66666/nim4cc>
-
-## 项目定位
-
-这个项目适合下面几类场景：
-
-- 你已经有 NVIDIA NIM Key，希望直接复用现有的 OpenAI Responses 或 Anthropic Messages 客户端
-- 你想把 Claude Code 一类依赖 Anthropic 接口形状的调用，接到 NIM 模型上
-- 你希望有一个轻量的公共网关，顺便提供模型健康度页面和官方模型目录页面
 
 网关不会持久化保存用户原始 NIM Key。调用时由用户自己通过请求头携带 Key，服务端只在当前请求链路中使用，并通过哈希隔离本地响应记录。
 
@@ -31,16 +25,13 @@ NIM4CC 是一个面向公开使用的 NVIDIA NIM 兼容网关，目标是把 NIM
 - 支持 Anthropic SSE 风格流式事件
 - 支持官方模型目录同步、本地缓存和公开展示
 - 支持调用成功率聚合统计和模型健康度看板
-- 上游超时会自动重试 1 次，失败请求也会计入健康度统计
 
 ## 当前接口
 
 ### 页面
 
-- `GET /`
-  模型健康度页面
-- `GET /model_list`
-  官方模型列表页面
+- `GET /` 模型健康度页面
+- `GET /model_list` 官方模型列表页面
 
 ### 页面数据接口
 
@@ -237,27 +228,17 @@ curl http://127.0.0.1:7860/v1/messages \
 
 ## 部署
 
-### Hugging Face Spaces
+### Hugging Face Spaces部署
 
-如果你要部署到 Hugging Face Spaces，推荐使用 Docker Space：
-
+0. 进入 Huggingface.co，并拥有一个账号
 1. 新建一个 Space
 2. SDK 选择 `Docker`
 3. 上传当前仓库内容
 4. 配置需要的环境变量
-5. 启动服务
-
-### 其他平台
-
-因为项目本身是标准 FastAPI + Uvicorn + Docker 结构，也适合直接部署到：
-
-- 自建 Linux 服务器
-- 云主机 / 容器平台
-- 支持 Docker 的托管环境
+5. 启动服务即可使用
 
 ## 已知限制
 
-- 当前核心逻辑集中在 [app/main.py](./app/main.py)，更适合快速迭代，不算是最终形态的模块化结构
 - Anthropic server-side tools 和 `mcp_servers` 目前不支持
 - README 中如果提到的外部脚本或部署目录与你本地实际内容不一致，请以仓库当前文件结构为准
 
@@ -270,4 +251,3 @@ curl http://127.0.0.1:7860/v1/messages \
 - NVIDIA Build: <https://build.nvidia.com/>
 - NVIDIA NIM API 文档: <https://docs.api.nvidia.com/>
 - NVIDIA NIM + Claude Code 集成: <https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html>
-
