@@ -488,6 +488,35 @@ body {
   margin-top: 16px;
 }
 
+.page-repo-footer {
+  width: min(1560px, calc(100vw - 56px));
+  margin: 0 auto 28px;
+  padding: 0 4px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.page-repo-footer a {
+  color: var(--cyan-deep);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.page-repo-footer a:hover {
+  text-decoration: underline;
+}
+
+.page-repo-footer-admin {
+  position: relative;
+  z-index: 1;
+  margin-top: 22px;
+}
+
 @media (max-width: 1200px) {
   .timeline-header,
   .health-row-card,
@@ -499,6 +528,10 @@ body {
 @media (max-width: 980px) {
   .health-page-shell,
   .catalog-page-shell {
+    width: min(100vw - 24px, 1560px);
+  }
+
+  .page-repo-footer {
     width: min(100vw - 24px, 1560px);
   }
 
@@ -569,5 +602,11 @@ body {
   .timeline-label {
     width: 34px;
     height: 34px;
+  }
+
+  .page-repo-footer {
+    margin-bottom: 22px;
+    font-size: 13px;
+    text-align: center;
   }
 }
