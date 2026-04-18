@@ -1,17 +1,21 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -33,12 +37,16 @@ MAX_UPSTREAM_CONNECTIONS = int(os.getenv("MAX_UPSTREAM_CONNECTIONS", "512"))
 MAX_KEEPALIVE_CONNECTIONS = int(os.getenv("MAX_KEEPALIVE_CONNECTIONS", "128"))
 MODEL_SYNC_INTERVAL_MINUTES = int(os.getenv("MODEL_SYNC_INTERVAL_MINUTES", "30"))
 PUBLIC_HISTORY_BUCKETS = int(os.getenv("PUBLIC_HISTORY_BUCKETS", "22"))
+HEALTH_SUMMARY_WINDOW_MINUTES = 120
 UPSTREAM_TIMEOUT_RETRIES = 1
 BUCKET_MINUTES = 10
 DEFAULT_MONITORED_MODELS = "z-ai/glm5,z-ai/glm4.7,minimaxai/minimax-m2.5,minimaxai/minimax-m2.7,moonshotai/kimi-k2.5,deepseek-ai/deepseek-v3.2,google/gemma-4-31b-it,qwen/qwen3.5-397b-a17b"
 MODEL_LIST = [item.strip() for item in os.getenv("MODEL_LIST", DEFAULT_MONITORED_MODELS).split(",") if item.strip()]
 APP_TIMEZONE = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Shanghai"))
 ANTHROPIC_API_VERSION = "2023-06-01"
+ANTHROPIC_INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
+ANTHROPIC_MIN_THINKING_BUDGET_TOKENS = 1024
+ANTHROPIC_SERVER_TOOL_MAX_ITERATIONS = 8
 ANTHROPIC_SERVER_TOOL_PREFIXES = (
     "web_search_",
     "web_fetch_",
@@ -47,12 +55,16 @@ ANTHROPIC_SERVER_TOOL_PREFIXES = (
     "tool_search_tool_",
     "mcp_toolset",
 )
+WEB_SEARCH_RSS_URL = os.getenv("WEB_SEARCH_RSS_URL", "https://www.bing.com/search")
+WEB_SEARCH_DEFAULT_MAX_RESULTS = int(os.getenv("WEB_SEARCH_DEFAULT_MAX_RESULTS", "5"))
+WEB_SEARCH_MAX_QUERY_LENGTH = int(os.getenv("WEB_SEARCH_MAX_QUERY_LENGTH", "512"))
 
 http_client: httpx.AsyncClient | None = None
 model_cache: list[dict[str, Any]] = []
 model_cache_synced_at: str | None = None
 model_cache_lock: asyncio.Lock | None = None
 model_sync_task: asyncio.Task[None] | None = None
+THINK_TAG_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
 
 
 def utcnow() -> datetime:
@@ -535,6 +547,10 @@ def extract_anthropic_text(value: Any) -> str:
         value_type = value.get("type")
         if value_type in {"text", "input_text", "output_text"}:
             return str(value.get("text", ""))
+        if value_type == "thinking":
+            return str(value.get("thinking", ""))
+        if value_type == "redacted_thinking":
+            return ""
         if value_type in {"image", "document"}:
             return f"[{value_type} content omitted]"
         if "content" in value:
@@ -569,6 +585,175 @@ def anthropic_result_block_to_text(block: dict[str, Any]) -> str:
 def is_anthropic_tool_result_block(block: dict[str, Any]) -> bool:
     block_type = block.get("type")
     return isinstance(block_type, str) and (block_type == "tool_result" or block_type.endswith("_tool_result"))
+
+
+def parse_anthropic_beta_header(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def has_anthropic_message_prefill(messages: Any) -> bool:
+    if not isinstance(messages, list) or not messages:
+        return False
+    last_message = messages[-1]
+    if not isinstance(last_message, dict):
+        return False
+    if last_message.get("role") != "assistant":
+        return False
+    blocks = anthropic_content_to_blocks(last_message.get("content"))
+    return any(block.get("type") != "redacted_thinking" for block in blocks)
+
+
+def is_forced_anthropic_tool_choice(tool_choice: Any) -> bool:
+    if isinstance(tool_choice, str):
+        return tool_choice in {"any", "required"}
+    if not isinstance(tool_choice, dict):
+        return False
+    return tool_choice.get("type") in {"any", "tool"}
+
+
+def build_anthropic_thinking_config(body: dict[str, Any], anthropic_beta: str | None) -> dict[str, Any]:
+    thinking = body.get("thinking")
+    enabled = False
+    budget_tokens = None
+
+    if thinking is None:
+        return {"enabled": False, "budget_tokens": None, "synthetic_signature": True}
+    if isinstance(thinking, bool):
+        thinking = {"type": "enabled" if thinking else "disabled"}
+    if not isinstance(thinking, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="thinking 字段必须是对象或布尔值。")
+
+    raw_thinking_type = thinking.get("type")
+    if isinstance(raw_thinking_type, bool):
+        thinking_type = "enabled" if raw_thinking_type else "disabled"
+    elif isinstance(raw_thinking_type, str):
+        lowered_type = raw_thinking_type.strip().lower()
+        if lowered_type in {"enabled", "enable", "on", "true"}:
+            thinking_type = "enabled"
+        elif lowered_type in {"disabled", "disable", "off", "false"}:
+            thinking_type = "disabled"
+        else:
+            thinking_type = lowered_type
+    elif "enabled" in thinking:
+        thinking_type = "enabled" if bool(thinking.get("enabled")) else "disabled"
+    elif any(key in thinking for key in ("budget_tokens", "budgetTokens")):
+        thinking_type = "enabled"
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="thinking.type 仅支持 enabled 或 disabled。")
+
+    if thinking_type == "disabled":
+        return {"enabled": False, "budget_tokens": None, "synthetic_signature": True}
+    if thinking_type != "enabled":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="thinking.type 仅支持 enabled 或 disabled。")
+
+    budget_tokens = thinking.get("budget_tokens", thinking.get("budgetTokens"))
+    if isinstance(budget_tokens, str):
+        try:
+            budget_tokens = int(budget_tokens.strip())
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="thinking.enabled 时必须提供整数类型的 budget_tokens。",
+            ) from exc
+    if not isinstance(budget_tokens, int):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="thinking.enabled 时必须提供整数类型的 budget_tokens。")
+    if budget_tokens < ANTHROPIC_MIN_THINKING_BUDGET_TOKENS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"thinking.budget_tokens 不能小于 {ANTHROPIC_MIN_THINKING_BUDGET_TOKENS}。",
+        )
+
+    max_tokens = body.get("max_tokens")
+    beta_flags = parse_anthropic_beta_header(anthropic_beta)
+    interleaved_thinking = (
+        ANTHROPIC_INTERLEAVED_THINKING_BETA in beta_flags
+        and bool(body.get("tools"))
+    )
+    if isinstance(max_tokens, int) and budget_tokens >= max_tokens and not interleaved_thinking:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="thinking.budget_tokens 必须小于 max_tokens；只有启用 interleaved thinking beta 且使用工具时可以例外。",
+        )
+
+    if body.get("temperature") is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Anthropic thinking 模式不支持自定义 temperature。",
+        )
+
+    top_p = body.get("top_p")
+    if top_p is not None:
+        try:
+            top_p_value = float(top_p)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="top_p 必须是数值。",
+            ) from exc
+        if not (0.95 <= top_p_value <= 1.0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Anthropic thinking 模式下 top_p 只能在 0.95 到 1.0 之间。",
+            )
+
+    if is_forced_anthropic_tool_choice(body.get("tool_choice")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Anthropic thinking 模式不支持 forced tool choice。",
+        )
+
+    if has_anthropic_message_prefill(body.get("messages")):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Anthropic thinking 模式不支持 assistant prefill。",
+        )
+
+    enabled = True
+    return {
+        "enabled": enabled,
+        "budget_tokens": budget_tokens,
+        "interleaved": interleaved_thinking,
+        "synthetic_signature": True,
+    }
+
+
+def build_synthetic_thinking_signature(model_id: str | None, thinking_text: str) -> str:
+    digest = hashlib.sha256(f"{model_id or 'unknown'}\n{thinking_text}".encode("utf-8")).digest()
+    encoded = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return f"nimthinking_{encoded}"
+
+
+def split_anthropic_thinking_blocks(text: str, model_id: str | None) -> list[dict[str, Any]]:
+    if not text:
+        return []
+
+    blocks: list[dict[str, Any]] = []
+    cursor = 0
+    for match in THINK_TAG_PATTERN.finditer(text):
+        before = text[cursor:match.start()]
+        if before.strip():
+            blocks.append({"type": "text", "text": before.strip()})
+
+        thinking_text = match.group(1).strip()
+        if thinking_text:
+            blocks.append(
+                {
+                    "type": "thinking",
+                    "thinking": thinking_text,
+                    "signature": build_synthetic_thinking_signature(model_id, thinking_text),
+                }
+            )
+        cursor = match.end()
+
+    if cursor == 0:
+        return [{"type": "text", "text": text.strip()}] if text.strip() else []
+
+    after = text[cursor:]
+    if after.strip():
+        blocks.append({"type": "text", "text": after.strip()})
+    return blocks
 
 
 def build_bash_tool_schema() -> dict[str, Any]:
@@ -717,6 +902,110 @@ def build_computer_tool_schema(tool_type: str | None) -> dict[str, Any]:
     }
 
 
+def build_web_search_tool_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The web search query to execute.",
+            },
+        },
+        "required": ["query"],
+    }
+
+
+def normalize_domain_name(value: str) -> str:
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = (parsed.netloc or parsed.path or "").strip().lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host.split("/", 1)[0]
+
+
+def normalize_domain_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized = [normalize_domain_name(str(item)) for item in values if str(item).strip()]
+    return [item for item in normalized if item]
+
+
+def domain_matches(host: str, domain: str) -> bool:
+    return host == domain or host.endswith(f".{domain}")
+
+
+def filter_web_search_url(url: str, allowed_domains: list[str], blocked_domains: list[str]) -> bool:
+    try:
+        host = normalize_domain_name(url)
+    except Exception:
+        return False
+    if not host:
+        return False
+    if allowed_domains and not any(domain_matches(host, domain) for domain in allowed_domains):
+        return False
+    if blocked_domains and any(domain_matches(host, domain) for domain in blocked_domains):
+        return False
+    return True
+
+
+def build_web_search_tool_description(raw_tool: dict[str, Any]) -> str:
+    description = raw_tool.get("description") or "Search the public web and return concise result metadata."
+    allowed_domains = normalize_domain_list(raw_tool.get("allowed_domains"))
+    blocked_domains = normalize_domain_list(raw_tool.get("blocked_domains"))
+    if allowed_domains:
+        description = f"{description}\n\nOnly search and return results from these domains: {', '.join(allowed_domains)}."
+    if blocked_domains:
+        description = f"{description}\n\nDo not return results from these domains: {', '.join(blocked_domains)}."
+    return description
+
+
+def build_server_tool_result_error_block(
+    result_type: str,
+    tool_use_id: str,
+    error_code: str,
+    message: str | None = None,
+) -> dict[str, Any]:
+    error_item: dict[str, Any] = {"type": f"{result_type}_error", "error_code": error_code}
+    if message:
+        error_item["message"] = message
+    return {
+        "type": result_type,
+        "tool_use_id": tool_use_id,
+        "content": error_item,
+        "is_error": True,
+    }
+
+
+def build_web_search_encrypted_content(payload: dict[str, Any]) -> str:
+    raw = json_dumps(payload).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"nimsearch_{encoded}"
+
+
+def parse_rss_results(xml_text: str) -> list[dict[str, Any]]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    results: list[dict[str, Any]] = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        description = (item.findtext("description") or "").strip()
+        pub_date = (item.findtext("pubDate") or "").strip()
+        if not title or not link:
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": link,
+                "snippet": description,
+                "page_age": pub_date or None,
+            }
+        )
+    return results
+
+
 def append_anthropic_tool_examples(description: str | None, examples: Any) -> str | None:
     if not isinstance(examples, list) or not examples:
         return description
@@ -763,10 +1052,47 @@ def anthropic_tools_to_chat_tools(tools: Any) -> tuple[list[dict[str, Any]], dic
                 detail=f"当前网关暂不支持仅允许 programmatic caller 的工具：{tool_name or tool_type or 'unknown'}。",
             )
 
-        if isinstance(tool_type, str) and (tool_type == "mcp_toolset" or tool_type.startswith(ANTHROPIC_SERVER_TOOL_PREFIXES)):
+        if tool_type == "mcp_toolset":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"当前网关暂不支持 Anthropic 服务端工具 '{tool_type}'；请改用客户端工具或自定义 tools。",
+            )
+
+        if isinstance(tool_type, str) and tool_type.startswith("web_search_"):
+            tool_name = tool_name or "web_search"
+            if normalize_domain_list(raw_tool.get("allowed_domains")) and normalize_domain_list(raw_tool.get("blocked_domains")):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="web_search 工具不能同时设置 allowed_domains 和 blocked_domains。",
+                )
+            description = build_web_search_tool_description(raw_tool)
+            parameters = build_web_search_tool_schema()
+            normalized.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": description,
+                        "parameters": parameters,
+                    },
+                }
+            )
+            metadata_by_name[tool_name] = {
+                "anthropic_type": tool_type,
+                "allowed_callers": sorted(allowed_callers_set) or ["direct"],
+                "server_execution": "web_search",
+                "allowed_domains": normalize_domain_list(raw_tool.get("allowed_domains")),
+                "blocked_domains": normalize_domain_list(raw_tool.get("blocked_domains")),
+                "user_location": raw_tool.get("user_location") if isinstance(raw_tool.get("user_location"), dict) else None,
+                "max_uses": raw_tool.get("max_uses") if isinstance(raw_tool.get("max_uses"), int) and raw_tool.get("max_uses") > 0 else None,
+                "uses": 0,
+            }
+            continue
+
+        if isinstance(tool_type, str) and tool_type.startswith(ANTHROPIC_SERVER_TOOL_PREFIXES):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"当前网关暂不支持 Anthropic 服务端工具 '{tool_type}'；目前已兼容 web_search 工具，其他服务端工具仍需单独适配。",
             )
 
         if isinstance(tool_type, str) and tool_type.startswith("bash_"):
@@ -862,6 +1188,13 @@ def anthropic_messages_to_chat_messages(body: dict[str, Any]) -> list[dict[str, 
                 if block_type == "text":
                     text_chunks.append(str(block.get("text", "")))
                     continue
+                if block_type == "thinking":
+                    thinking_text = str(block.get("thinking", "")).strip()
+                    if thinking_text:
+                        text_chunks.append(f"<think>\n{thinking_text}\n</think>")
+                    continue
+                if block_type == "redacted_thinking":
+                    continue
                 if block_type in {"tool_use", "server_tool_use"}:
                     arguments = block.get("input")
                     if not isinstance(arguments, str):
@@ -927,13 +1260,11 @@ def anthropic_messages_to_chat_messages(body: dict[str, Any]) -> list[dict[str, 
     return [message for message in chat_messages if message.get("content") is not None or message.get("tool_calls")]
 
 
-def build_anthropic_chat_payload(body: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    thinking = body.get("thinking")
-    if thinking and (not isinstance(thinking, dict) or thinking.get("type") != "disabled"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="当前网关暂不支持 Anthropic thinking 模式。",
-        )
+def build_anthropic_chat_payload(
+    body: dict[str, Any],
+    anthropic_beta: str | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    thinking_config = build_anthropic_thinking_config(body, anthropic_beta)
     if body.get("mcp_servers"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -948,6 +1279,11 @@ def build_anthropic_chat_payload(body: dict[str, Any]) -> tuple[dict[str, Any], 
         "messages": messages,
         "max_tokens": body.get("max_tokens"),
     }
+    if thinking_config["enabled"]:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+        payload["nvext"] = {"max_thinking_tokens": thinking_config["budget_tokens"]}
+    elif body.get("thinking") is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     if tools:
         payload["tools"] = tools
     if tool_choice is not None:
@@ -960,7 +1296,7 @@ def build_anthropic_chat_payload(body: dict[str, Any]) -> tuple[dict[str, Any], 
         payload["top_p"] = body.get("top_p")
     if body.get("stop_sequences"):
         payload["stop"] = body.get("stop_sequences")
-    return payload, messages, tool_metadata
+    return payload, messages, tool_metadata, thinking_config
 
 
 def parse_anthropic_tool_input(arguments: Any) -> dict[str, Any]:
@@ -991,6 +1327,235 @@ def normalize_anthropic_tool_use_id(tool_use_id: Any) -> str:
     return f"toolu_{uuid.uuid4().hex[:24]}"
 
 
+def anthropic_block_to_chat_tool_call(block: dict[str, Any]) -> dict[str, Any]:
+    arguments = block.get("input") or {}
+    if not isinstance(arguments, str):
+        arguments = json_dumps(arguments)
+    return {
+        "id": block.get("id") or normalize_anthropic_tool_use_id(None),
+        "type": "function",
+        "function": {
+            "name": block.get("name"),
+            "arguments": arguments,
+        },
+    }
+
+
+def anthropic_blocks_to_chat_assistant_message(blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    text_chunks: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+
+    for block in blocks:
+        block_type = block.get("type")
+        if block_type == "text":
+            text_value = str(block.get("text", "")).strip()
+            if text_value:
+                text_chunks.append(text_value)
+            continue
+        if block_type == "thinking":
+            thinking_text = str(block.get("thinking", "")).strip()
+            if thinking_text:
+                text_chunks.append(f"<think>\n{thinking_text}\n</think>")
+            continue
+        if block_type in {"tool_use", "server_tool_use"}:
+            tool_calls.append(anthropic_block_to_chat_tool_call(block))
+
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(filter(None, text_chunks))}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def is_server_tool_block(block: dict[str, Any], tool_metadata: dict[str, dict[str, Any]]) -> bool:
+    if block.get("type") != "server_tool_use":
+        return False
+    tool_name = block.get("name")
+    return bool(tool_name and tool_metadata.get(tool_name, {}).get("server_execution"))
+
+
+def count_server_tool_blocks(content_blocks: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for block in content_blocks:
+        if block.get("type") != "server_tool_use":
+            continue
+        name = str(block.get("name") or "unknown")
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def merge_anthropic_usage(base_usage: dict[str, Any], extra_usage: dict[str, Any]) -> dict[str, Any]:
+    merged = {
+        "input_tokens": (base_usage or {}).get("input_tokens") or 0,
+        "output_tokens": (base_usage or {}).get("output_tokens") or 0,
+    }
+    merged["input_tokens"] += (extra_usage or {}).get("input_tokens") or 0
+    merged["output_tokens"] += (extra_usage or {}).get("output_tokens") or 0
+
+    base_server = dict((base_usage or {}).get("server_tool_use") or {})
+    extra_server = (extra_usage or {}).get("server_tool_use") or {}
+    for key, value in extra_server.items():
+        base_server[key] = (base_server.get(key) or 0) + (value or 0)
+    if base_server:
+        merged["server_tool_use"] = base_server
+    return merged
+
+
+async def execute_web_search_tool(block: dict[str, Any], metadata: dict[str, Any]) -> tuple[dict[str, Any], str, dict[str, int]]:
+    tool_use_id = block.get("id") or normalize_anthropic_tool_use_id(None)
+    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    query = str(
+        tool_input.get("query")
+        or tool_input.get("q")
+        or tool_input.get("search_query")
+        or ""
+    ).strip()
+
+    if not query:
+        result_block = build_server_tool_result_error_block(
+            "web_search_tool_result",
+            tool_use_id,
+            "invalid_input",
+            "web_search 需要 query 字段。",
+        )
+        return result_block, json_dumps({"error": "missing_query"}), {"web_search_requests": 1}
+
+    if len(query) > WEB_SEARCH_MAX_QUERY_LENGTH:
+        result_block = build_server_tool_result_error_block(
+            "web_search_tool_result",
+            tool_use_id,
+            "query_too_long",
+            f"query 长度不能超过 {WEB_SEARCH_MAX_QUERY_LENGTH} 个字符。",
+        )
+        return result_block, json_dumps({"error": "query_too_long", "query": query}), {"web_search_requests": 1}
+
+    max_uses = metadata.get("max_uses")
+    if isinstance(max_uses, int) and metadata.get("uses", 0) >= max_uses:
+        result_block = build_server_tool_result_error_block(
+            "web_search_tool_result",
+            tool_use_id,
+            "max_uses_exceeded",
+            "web_search 已达到当前请求允许的最大调用次数。",
+        )
+        return result_block, json_dumps({"error": "max_uses_exceeded", "query": query}), {"web_search_requests": 0}
+
+    metadata["uses"] = metadata.get("uses", 0) + 1
+
+    search_query = query
+    user_location = metadata.get("user_location") if isinstance(metadata.get("user_location"), dict) else None
+    if user_location:
+        location_parts = [
+            str(user_location.get(key)).strip()
+            for key in ("city", "region", "country")
+            if user_location.get(key)
+        ]
+        if location_parts:
+            search_query = f"{query} {' '.join(location_parts)}"
+
+    client = await get_http_client()
+    try:
+        response = await client.get(
+            WEB_SEARCH_RSS_URL,
+            params={"format": "rss", "q": search_query},
+            headers={
+                "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
+                "User-Agent": "nim4cc/1.0 (+https://github.com/Geek66666/nim4cc)",
+            },
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        result_block = build_server_tool_result_error_block(
+            "web_search_tool_result",
+            tool_use_id,
+            "search_unavailable",
+            f"web_search 上游请求失败：HTTP {exc.response.status_code}",
+        )
+        return result_block, json_dumps({"error": "search_unavailable", "query": query}), {"web_search_requests": 1}
+    except httpx.RequestError as exc:
+        result_block = build_server_tool_result_error_block(
+            "web_search_tool_result",
+            tool_use_id,
+            "search_unavailable",
+            f"web_search 请求异常：{exc}",
+        )
+        return result_block, json_dumps({"error": "search_unavailable", "query": query}), {"web_search_requests": 1}
+
+    allowed_domains = metadata.get("allowed_domains") or []
+    blocked_domains = metadata.get("blocked_domains") or []
+    parsed_results = [
+        item
+        for item in parse_rss_results(response.text)
+        if filter_web_search_url(item.get("url", ""), allowed_domains, blocked_domains)
+    ][:max(1, WEB_SEARCH_DEFAULT_MAX_RESULTS)]
+
+    outward_results: list[dict[str, Any]] = []
+    model_results: list[dict[str, Any]] = []
+    for result in parsed_results:
+        encrypted_content = build_web_search_encrypted_content(
+            {
+                "query": query,
+                "url": result.get("url"),
+                "title": result.get("title"),
+                "snippet": result.get("snippet"),
+                "page_age": result.get("page_age"),
+                "retrieved_at": utcnow_iso(),
+            }
+        )
+        outward_item = {
+            "type": "web_search_result",
+            "url": result.get("url"),
+            "title": result.get("title"),
+            "encrypted_content": encrypted_content,
+        }
+        if result.get("page_age"):
+            outward_item["page_age"] = result.get("page_age")
+        outward_results.append(outward_item)
+        model_results.append(
+            {
+                "url": result.get("url"),
+                "title": result.get("title"),
+                "snippet": result.get("snippet"),
+                "page_age": result.get("page_age"),
+                "encrypted_content": encrypted_content,
+            }
+        )
+
+    result_block = {
+        "type": "web_search_tool_result",
+        "tool_use_id": tool_use_id,
+        "content": outward_results,
+    }
+    model_payload = json_dumps({"query": query, "results": model_results})
+    return result_block, model_payload, {"web_search_requests": 1}
+
+
+async def execute_anthropic_server_tool_block(
+    block: dict[str, Any],
+    tool_metadata: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], str, dict[str, int]]:
+    tool_name = block.get("name")
+    metadata = tool_metadata.get(tool_name or "")
+    if not metadata:
+        result_block = build_server_tool_result_error_block(
+            "tool_result",
+            block.get("id") or normalize_anthropic_tool_use_id(None),
+            "unknown_tool",
+            f"未找到服务端工具 {tool_name} 的元数据。",
+        )
+        return result_block, json_dumps({"error": "unknown_tool"}), {}
+
+    server_execution = metadata.get("server_execution")
+    if server_execution == "web_search":
+        return await execute_web_search_tool(block, metadata)
+
+    result_block = build_server_tool_result_error_block(
+        "tool_result",
+        block.get("id") or normalize_anthropic_tool_use_id(None),
+        "unsupported_tool",
+        f"当前网关尚未实现服务端工具 {tool_name}。",
+    )
+    return result_block, json_dumps({"error": "unsupported_tool"}), {}
+
+
 def anthropic_stop_reason(finish_reason: str | None, content_blocks: list[dict[str, Any]]) -> str:
     if any(block.get("type") == "tool_use" for block in content_blocks):
         return "tool_use"
@@ -1005,21 +1570,31 @@ def chat_completion_to_anthropic_message(
     body: dict[str, Any],
     upstream_json: dict[str, Any],
     tool_metadata: dict[str, dict[str, Any]],
+    thinking_config: dict[str, Any],
 ) -> dict[str, Any]:
-    del tool_metadata
     upstream_message, finish_reason = extract_upstream_message(upstream_json)
     assistant_text, tool_calls = extract_text_and_tool_calls(upstream_message)
     content_blocks: list[dict[str, Any]] = []
     if assistant_text:
-        content_blocks.append({"type": "text", "text": assistant_text})
+        if thinking_config.get("enabled"):
+            content_blocks.extend(split_anthropic_thinking_blocks(assistant_text, body.get("model")))
+        else:
+            content_blocks.append({"type": "text", "text": assistant_text})
     for tool_call in tool_calls:
+        tool_name = tool_call.get("name")
+        tool_info = tool_metadata.get(tool_name or "", {})
+        is_server_tool = bool(tool_info.get("server_execution"))
         content_blocks.append(
             {
-                "type": "tool_use",
-                "id": normalize_anthropic_tool_use_id(tool_call.get("id")),
-                "name": tool_call.get("name"),
+                "type": "server_tool_use" if is_server_tool else "tool_use",
+                "id": (
+                    tool_call.get("id")
+                    if isinstance(tool_call.get("id"), str) and tool_call.get("id").startswith("srvtoolu_")
+                    else (f"srvtoolu_{uuid.uuid4().hex[:24]}" if is_server_tool else normalize_anthropic_tool_use_id(tool_call.get("id")))
+                ),
+                "name": tool_name,
                 "input": parse_anthropic_tool_input(tool_call.get("arguments")),
-                "caller": {"type": "direct"},
+                **({} if is_server_tool else {"caller": {"type": "direct"}}),
             }
         )
 
@@ -1051,6 +1626,78 @@ def build_anthropic_storage_items(body: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
+async def create_anthropic_message_with_server_tools(
+    api_key: str,
+    body: dict[str, Any],
+    chat_payload: dict[str, Any],
+    tool_metadata: dict[str, dict[str, Any]],
+    thinking_config: dict[str, Any],
+) -> tuple[dict[str, Any], float]:
+    request_messages = list(chat_payload.get("messages") or [])
+    base_payload = {key: value for key, value in chat_payload.items() if key != "messages"}
+    accumulated_content: list[dict[str, Any]] = []
+    accumulated_usage: dict[str, Any] = {}
+    last_message_payload: dict[str, Any] | None = None
+    started = time.perf_counter()
+
+    for _ in range(ANTHROPIC_SERVER_TOOL_MAX_ITERATIONS):
+        loop_payload = {**base_payload, "messages": request_messages}
+        upstream_json, _latency_ms = await post_nvidia_chat_completion(api_key, loop_payload)
+        loop_message = chat_completion_to_anthropic_message(body, upstream_json, tool_metadata, thinking_config)
+        last_message_payload = loop_message
+        accumulated_usage = merge_anthropic_usage(accumulated_usage, loop_message.get("usage") or {})
+
+        loop_content = list(loop_message.get("content") or [])
+        accumulated_content.extend(loop_content)
+
+        client_tool_blocks = [block for block in loop_content if block.get("type") == "tool_use"]
+        server_tool_blocks = [block for block in loop_content if is_server_tool_block(block, tool_metadata)]
+
+        if client_tool_blocks:
+            break
+        if not server_tool_blocks:
+            break
+
+        request_messages.append(anthropic_blocks_to_chat_assistant_message(loop_content))
+        executed_usage: dict[str, Any] = {}
+        for block in server_tool_blocks:
+            result_block, model_tool_content, usage_increment = await execute_anthropic_server_tool_block(block, tool_metadata)
+            accumulated_content.append(result_block)
+            executed_usage = merge_anthropic_usage(executed_usage, {"server_tool_use": usage_increment})
+            request_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": block.get("id"),
+                    "content": model_tool_content,
+                }
+            )
+        accumulated_usage = merge_anthropic_usage(accumulated_usage, executed_usage)
+    else:
+        accumulated_content.append(
+            build_server_tool_result_error_block(
+                "tool_result",
+                f"srvtoolu_{uuid.uuid4().hex[:24]}",
+                "max_iterations_exceeded",
+                "服务端工具循环次数过多，已停止继续执行。",
+            )
+        )
+
+    if last_message_payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="上游未返回有效的 Anthropic 兼容消息。",
+        )
+
+    message_payload = {
+        **last_message_payload,
+        "content": accumulated_content,
+        "stop_reason": anthropic_stop_reason(None, accumulated_content),
+        "usage": accumulated_usage,
+    }
+    latency_ms = round((time.perf_counter() - started) * 1000, 2)
+    return message_payload, latency_ms
+
+
 def build_anthropic_streaming_response(message_payload: dict[str, Any], anthropic_version: str | None) -> StreamingResponse:
     async def event_stream() -> Any:
         opening_message = {
@@ -1071,6 +1718,18 @@ def build_anthropic_streaming_response(message_payload: dict[str, Any], anthropi
                 yield f"event: content_block_stop\ndata: {json_dumps({'type': 'content_block_stop', 'index': index})}\n\n"
                 continue
 
+            if block_type == "thinking":
+                content_block = {"type": "thinking", "thinking": ""}
+                yield f"event: content_block_start\ndata: {json_dumps({'type': 'content_block_start', 'index': index, 'content_block': content_block})}\n\n"
+                thinking_text = str(block.get("thinking", ""))
+                if thinking_text:
+                    yield f"event: content_block_delta\ndata: {json_dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'thinking_delta', 'thinking': thinking_text}})}\n\n"
+                signature = block.get("signature")
+                if signature:
+                    yield f"event: content_block_delta\ndata: {json_dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'signature_delta', 'signature': signature}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json_dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+                continue
+
             if block_type == "tool_use":
                 content_block = {**block, "input": {}}
                 yield f"event: content_block_start\ndata: {json_dumps({'type': 'content_block_start', 'index': index, 'content_block': content_block})}\n\n"
@@ -1078,6 +1737,21 @@ def build_anthropic_streaming_response(message_payload: dict[str, Any], anthropi
                 if input_json:
                     yield f"event: content_block_delta\ndata: {json_dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': input_json}})}\n\n"
                 yield f"event: content_block_stop\ndata: {json_dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+                continue
+
+            if block_type == "server_tool_use":
+                content_block = {**block, "input": {}}
+                yield f"event: content_block_start\ndata: {json_dumps({'type': 'content_block_start', 'index': index, 'content_block': content_block})}\n\n"
+                input_json = json_dumps(block.get("input") or {})
+                if input_json:
+                    yield f"event: content_block_delta\ndata: {json_dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'input_json_delta', 'partial_json': input_json}})}\n\n"
+                yield f"event: content_block_stop\ndata: {json_dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+                continue
+
+            if isinstance(block_type, str) and block_type.endswith("_tool_result"):
+                yield f"event: content_block_start\ndata: {json_dumps({'type': 'content_block_start', 'index': index, 'content_block': block})}\n\n"
+                yield f"event: content_block_stop\ndata: {json_dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+                continue
 
         yield f"event: message_delta\ndata: {json_dumps({'type': 'message_delta', 'delta': {'stop_reason': message_payload.get('stop_reason'), 'stop_sequence': message_payload.get('stop_sequence')}, 'usage': {'output_tokens': (message_payload.get('usage') or {}).get('output_tokens')}})}\n\n"
         yield "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n"
@@ -1349,6 +2023,11 @@ def load_dashboard_data() -> dict[str, Any]:
         total_requests = totals_row["total_requests"] if totals_row else 0
         now_bucket = bucket_start()
         bucket_points = [(now_bucket - timedelta(minutes=BUCKET_MINUTES * offset)).isoformat() for offset in reversed(range(PUBLIC_HISTORY_BUCKETS))]
+        health_window_buckets = max(1, HEALTH_SUMMARY_WINDOW_MINUTES // BUCKET_MINUTES)
+        health_window_points = [
+            (now_bucket - timedelta(minutes=BUCKET_MINUTES * offset)).isoformat()
+            for offset in reversed(range(health_window_buckets))
+        ]
         placeholders = ",".join("?" for _ in MODEL_LIST) if MODEL_LIST else "''"
         totals_by_model = {
             row["model_id"]: row["total_count"]
@@ -1357,7 +2036,8 @@ def load_dashboard_data() -> dict[str, Any]:
                 MODEL_LIST,
             ).fetchall()
         } if MODEL_LIST else {}
-        since = bucket_points[0] if bucket_points else utcnow_iso()
+        since_candidates = [value for value in [bucket_points[0] if bucket_points else None, health_window_points[0] if health_window_points else None] if value]
+        since = min(since_candidates) if since_candidates else utcnow_iso()
         recent_rows = conn.execute(
             f"SELECT bucket_start, model_id, total_count, success_count FROM metric_buckets WHERE model_id IN ({placeholders}) AND bucket_start >= ? ORDER BY bucket_start ASC",
             [*MODEL_LIST, since],
@@ -1366,10 +2046,10 @@ def load_dashboard_data() -> dict[str, Any]:
         for row in recent_rows:
             row_map.setdefault(row["model_id"], {})[row["bucket_start"]] = row
         models: list[dict[str, Any]] = []
-        latest_rates: list[float] = []
+        health_window_rates: list[float] = []
         for model_id in MODEL_LIST:
             points: list[dict[str, Any]] = []
-            latest_rate: float | None = None
+            latest_bucket_rate: float | None = None
             for bucket_value in bucket_points:
                 row = row_map.get(model_id, {}).get(bucket_value)
                 total_count = row["total_count"] if row else 0
@@ -1384,28 +2064,41 @@ def load_dashboard_data() -> dict[str, Any]:
                         "success_rate": success_rate,
                     }
                 )
-                if total_count:
-                    latest_rate = success_rate
-            if latest_rate is not None:
-                latest_rates.append(latest_rate)
-            average_rate = None
-            non_empty = [point["success_rate"] for point in points if point["success_rate"] is not None]
-            if non_empty:
-                average_rate = round(sum(non_empty) / len(non_empty), 1)
+                if bucket_value == bucket_points[-1] and total_count:
+                    latest_bucket_rate = success_rate
+
+            health_window_total = 0
+            health_window_success = 0
+            for bucket_value in health_window_points:
+                row = row_map.get(model_id, {}).get(bucket_value)
+                if not row:
+                    continue
+                health_window_total += row["total_count"]
+                health_window_success += row["success_count"]
+
+            health_window_rate = round((health_window_success / health_window_total) * 100, 1) if health_window_total else None
+            if health_window_rate is not None:
+                health_window_rates.append(health_window_rate)
             models.append(
                 {
                     "model_id": model_id,
                     "provider": normalize_provider(model_id),
                     "total_calls": totals_by_model.get(model_id, 0),
-                    "latest_success_rate": latest_rate,
-                    "average_success_rate": average_rate,
+                    "latest_success_rate": health_window_rate,
+                    "average_success_rate": health_window_rate,
+                    "health_window_success_rate": health_window_rate,
+                    "health_window_total_count": health_window_total,
+                    "health_window_success_count": health_window_success,
+                    "health_window_minutes": HEALTH_SUMMARY_WINDOW_MINUTES,
+                    "latest_bucket_success_rate": latest_bucket_rate,
                     "points": points,
                 }
             )
-        average_health = round(sum(latest_rates) / len(latest_rates), 1) if latest_rates else None
+        average_health = round(sum(health_window_rates) / len(health_window_rates), 1) if health_window_rates else None
         return {
             "generated_at": utcnow_iso(),
             "bucket_minutes": BUCKET_MINUTES,
+            "health_window_minutes": HEALTH_SUMMARY_WINDOW_MINUTES,
             "total_requests": total_requests,
             "average_health": average_health,
             "models": models,
@@ -1563,8 +2256,7 @@ async def create_anthropic_message(
     anthropic_version: str | None = Header(default=None),
     anthropic_beta: str | None = Header(default=None),
 ):
-    del anthropic_beta
-    return await create_anthropic_message_impl(request, api_key, anthropic_version)
+    return await create_anthropic_message_impl(request, api_key, anthropic_version, anthropic_beta)
 
 
 @app.get("/v1/responses/{response_id}")
@@ -1587,7 +2279,12 @@ async def create_response(request: Request, api_key: str = Depends(extract_user_
     return await create_response_impl(request, api_key)
 
 
-async def create_anthropic_message_impl(request: Request, api_key: str, anthropic_version: str | None):
+async def create_anthropic_message_impl(
+    request: Request,
+    api_key: str,
+    anthropic_version: str | None,
+    anthropic_beta: str | None = None,
+):
     body = await request.json()
     if not isinstance(body, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请求体必须是 JSON 对象。")
@@ -1602,11 +2299,21 @@ async def create_anthropic_message_impl(request: Request, api_key: str, anthropi
 
     api_key_hash = hash_api_key(api_key)
     storage_items = build_anthropic_storage_items(body)
-    chat_payload, _chat_messages, tool_metadata = build_anthropic_chat_payload(body)
+    chat_payload, _chat_messages, tool_metadata, thinking_config = build_anthropic_chat_payload(body, anthropic_beta)
+    has_server_tools = any(meta.get("server_execution") for meta in tool_metadata.values())
 
     try:
-        upstream_json, latency_ms = await post_nvidia_chat_completion(api_key, chat_payload)
-        message_payload = chat_completion_to_anthropic_message(body, upstream_json, tool_metadata)
+        if has_server_tools:
+            message_payload, latency_ms = await create_anthropic_message_with_server_tools(
+                api_key,
+                body,
+                chat_payload,
+                tool_metadata,
+                thinking_config,
+            )
+        else:
+            upstream_json, latency_ms = await post_nvidia_chat_completion(api_key, chat_payload)
+            message_payload = chat_completion_to_anthropic_message(body, upstream_json, tool_metadata, thinking_config)
         await run_db(store_success_record, api_key_hash, body.get("model"), body, storage_items, message_payload, latency_ms)
     except HTTPException as exc:
         with contextlib.suppress(Exception):
@@ -1675,6 +2382,4 @@ async def create_response_impl(request: Request, api_key: str):
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     return response_payload
-
-
 

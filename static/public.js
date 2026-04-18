@@ -51,10 +51,11 @@ function renderOverview(data) {
   const totalCalls = data.total_requests ?? 0;
   const healthyModels = (data.models || []).filter((model) => (model.latest_success_rate ?? 0) >= 95).length;
   const displayedBuckets = data.models?.[0]?.points?.length || 0;
+  const healthWindowMinutes = data.health_window_minutes || 120;
 
   overviewCards.appendChild(createSummaryCard("总调用次数", totalCalls, "统计来自网关累计成功与失败请求"));
-  overviewCards.appendChild(createSummaryCard("平均健康度", averageHealth, "按监控模型最近 10 分钟成功率平均值计算"));
-  overviewCards.appendChild(createSummaryCard("高健康模型数", healthyModels, "最近一档成功率达到 95% 以上的模型数量"));
+  overviewCards.appendChild(createSummaryCard("平均健康度", averageHealth, `按监控模型最近 ${healthWindowMinutes} 分钟滚动成功率平均值计算`));
+  overviewCards.appendChild(createSummaryCard("高健康模型数", healthyModels, `最近 ${healthWindowMinutes} 分钟滚动成功率达到 95% 以上的模型数量`));
   overviewCards.appendChild(createSummaryCard("统计窗口", `${displayedBuckets * (data.bucket_minutes || 10)} 分钟`, `当前按 ${data.bucket_minutes || 10} 分钟粒度滚动统计`));
   dashboardUpdated.textContent = formatDateTime(data.generated_at);
 }
@@ -88,6 +89,7 @@ function renderHealthRows(models) {
   models.forEach((model) => {
     const latestRate = model.latest_success_rate === null || model.latest_success_rate === undefined ? "--" : `${model.latest_success_rate.toFixed(2)}%`;
     const latestMeta = rateMeta(model.latest_success_rate);
+    const healthWindowMinutes = model.health_window_minutes || 120;
 
     const row = document.createElement("article");
     row.className = "health-row-card";
@@ -100,7 +102,7 @@ function renderHealthRows(models) {
       <div class="health-row-copy">
         <h3 title="${model.model_id}">${model.model_id}</h3>
         <div class="health-meta-inline">
-          <span class="health-rate-pill ${latestMeta.className}">${latestRate}</span>
+          <span class="health-rate-pill ${latestMeta.className}" title="最近 ${healthWindowMinutes} 分钟滚动成功率">${latestRate}</span>
           <span class="health-rate-pill health-call-pill">调用 ${model.total_calls ?? 0} 次</span>
         </div>
       </div>
