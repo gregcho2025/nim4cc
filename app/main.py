@@ -2235,6 +2235,20 @@ async def build_models_response() -> dict[str, Any]:
     return {"object": "list", "data": model_cache}
 
 
+@app.get("/v1")
+async def v1_info() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "NIM4CC Gateway",
+        "version": "1.0",
+        "endpoints": {
+            "models": "/v1/models",
+            "responses": "/v1/responses",
+            "messages": "/v1/messages"
+        }
+    }
+
+
 @app.get("/v1/models")
 async def list_models_v1() -> dict[str, Any]:
     return await build_models_response()
