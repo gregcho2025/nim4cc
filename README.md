@@ -1,3 +1,13 @@
+---
+title: Nim4cc
+emoji: 🚀
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_file: app/main.py
+pinned: false
+---
+
 # NIM4CC（让NIM的模型在Codex和Claude Code里面物尽其用）
 
 NIM4CC 是一个面向公开使用的 NVIDIA NIM 兼容网关，目标是把 NIM 的 `chat/completions` 能力转换成更易接入的上层协议，并补上模型目录缓存、调用统计和健康度看板。
