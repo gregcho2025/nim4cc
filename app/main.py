@@ -2374,9 +2374,11 @@ async def create_response_impl(request: Request, api_key: str):
     except Exception as exc:
         with contextlib.suppress(Exception):
             await run_db(store_failure_metric, body.get("model"), str(exc))
+        import traceback
+        print(f"ERROR: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="网关处理请求时发生内部错误。",
+            detail=f"网关处理请求时发生内部错误: {str(exc)}",
         ) from exc
 
     if body.get("stream"):
