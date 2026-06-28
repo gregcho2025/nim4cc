@@ -2293,6 +2293,32 @@ async def create_response(request: Request, api_key: str = Depends(extract_user_
     return await create_response_impl(request, api_key)
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions_v1(request: Request, api_key: str = Depends(extract_user_api_key)):
+    """Standard OpenAI Chat Completions format passthrough"""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请求体必须是 JSON 对象。")
+    if not body.get("model"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="缺少 model 字段。")
+
+    client = await get_http_client()
+    response = await client.post(
+        CHAT_COMPLETIONS_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"},
+        json=body,
+    )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+    return response.json()
+
+
+@app.post("/chat/completions")
+async def chat_completions(request: Request, api_key: str = Depends(extract_user_api_key)):
+    """Standard OpenAI Chat Completions format passthrough"""
+    return await chat_completions_v1(request, api_key)
+
+
 async def create_anthropic_message_impl(
     request: Request,
     api_key: str,
