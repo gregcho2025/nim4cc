@@ -12,7 +12,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
